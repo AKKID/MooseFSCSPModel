@@ -1,0 +1,184 @@
+----- 对MooseFS进行建模的CSP代码 从头开始吧
+
+Reader = {0 .. 1}
+Writer = {0 .. 1}
+Chunk = {0 .. 3}
+fileinfo = {0 .. 3}
+data = {0 .. 5}
+
+channel RM : Reader.(fileinfo,Chunk)
+channel WM : Writer.(fileinfo,Chunk)
+channel RC : Reader.Chunk.(fileinfo,data)
+channel WC : Writer.Chunk.(fileinfo,data)
+channel CR : Chunk.Reader.data
+
+channel createResult : Writer.Bool
+channel getLease : Writer.fileinfo.Bool
+channel writeResult : Writer.Chunk.Bool -- 用于chunk返回给 client 的通知
+channel writeResultToMaster : Writer.fileinfo.Bool
+channel sync : (fileinfo,data)
+
+channel accident
+channel MM : fileinfo
+channel MM2
+channel isSame:Bool
+
+
+READER(id,blockinfo) = 
+	RM.id!(blockinfo,0) -> RM.id?(_,chunk) -> 
+	RC.id.chunk!(blockinfo,0)-> 
+	CR.chunk.id?data -> READER(id,blockinfo)
+
+WRITER(id,blockinfo,item) = 
+	WM.id!(blockinfo,0) -> createResult.id?ok -> 
+	getLease.id.blockinfo?use -> 
+	if use 
+	then WRITER(id,blockinfo,item) 
+	else WM.id?(_,chunk) -> WC.id.chunk!(blockinfo,item) 
+			-> writeResult.id.chunk?suc 
+			-> if suc 
+			   then writeResultToMaster.id.blockinfo.True -> STOP 
+			   else WRITER(id,blockinfo,item)
+
+CREADER(cid,map) = 
+	 RC?id.cid?(blockinfo,_)->
+	 if mapMember(map,blockinfo) 
+	 then CR!cid.id!mapLookup(map,blockinfo) 
+	 	  -> CREADER(cid,map) 
+	 else CREADER(cid,map)
+  [] sync?(b,i) -> 
+  	 if mapMember(map,b) 
+	 then CREADER(cid,mapUpdate(map,b,i)) 
+	 else CREADER(cid,map)
+				   					
+CWRITER(cid,map) = 
+   WC?id.cid?(blockinfo,item) -> 
+   sync!(blockinfo,item) -> 
+   writeResult!id.cid!True -> 
+   CWRITER(cid,mapUpdate(map,blockinfo,item))
+
+ChunkServer(cid,map) = CWRITER(cid,map) [|{|sync|}|] CREADER(cid,map)
+
+
+
+f(<>,y) = false
+f(x,y) = let <(h,k)> = head(x) within
+			if h == y then True else f(tail(x),y)
+
+
+
+findCh(L) = 
+	let
+		helper(<>, tmp) = let (h,k) = head(tmp)
+							within h
+		helper(t,tmp) = 
+		let
+			<(h,k)> = head(t)
+			<(_,k')> = tmp
+		within
+			if k >= k' then helper(tail(t),tmp) else helper(tail(t),head(t))
+	within
+		helper(L, head(L))
+
+chUpdate(L,c)=
+	let
+		helper(<>,c,l) = l
+		helper(t,c,l) = 
+		let
+		   <(h,k)> = head(t)
+		within
+		   if h == c then helper(tail(t),c,l^<<(c,k + 1)>>) else helper(tail(t),c,l^<(head(t))>)
+    within
+    	helper(L,c,<<(0,0)>>)
+
+		
+		
+
+g(<>,y,s) = head(s)
+g(x,y,s) = let <(k,v)> = head(x) within
+				if k == y then g(tail(x),y,s ^ <v>) else g(tail(x),y,s)
+
+select(s, info) = g(s,info,<>)
+--seqUpdate(s,blockinfo) = seq(union(set(s),{<blockinfo,1>}))
+seqUpdate(s,blockinfo,c) = s ^ <<(blockinfo,c)>>
+
+MetaLogger(C,I,D) = 
+	accident -> MASTER(C,I,D)
+  []MM?blockinfo -> 
+	if f(C,blockinfo) 
+	then if mapLookup(I,blockinfo) 	
+        	 then MetaLogger(C,I,D) 
+        	 else MetaLogger(C,mapUpdate(I,blockinfo,True),D)	
+	else MetaLogger(seqUpdate(C,blockinfo,findCh(D)),mapUpdate(I,blockinfo,True),chUpdate(D,findCh(D)))
+ []MM2 -> MetaLogger(C,mapUpdate(I,blockinfo,False),D)
+
+MASTERREAD(C,I) = 
+	RM?id?(blockinfo,c) -> 
+	if f(C,blockinfo) 
+	then RM!id!(blockinfo,select(C, blockinfo)) 
+		 -> MASTERREAD(C,I)
+	else MASTERREAD(C,I)
+
+MASTERWRITE(C,I,D) = 
+	    writeResultToMaster?id?blockinfo?ok -> MM2 -> MASTERWRITE(C,mapUpdate(I,blockinfo,False),D)
+	  []WM?id?(blockinfo,_) ->  MM!blockinfo->
+		if f(C,blockinfo) 
+        then createResult!id!False ->
+        	 if mapLookup(I,blockinfo) 	
+        	 then getLease!id!blockinfo!True-> MASTERWRITE(C,I,D) 
+        	 else getLease!id!blockinfo!False -> 
+        	 	  WM.id!(blockinfo,select(C,blockinfo)) -> 
+        	      MASTERWRITE(C,mapUpdate(I,blockinfo,True),D)			
+		else createResult!id!True -> getLease!id!blockinfo!False -> 
+			 WM!id!(blockinfo,findCh(D)) -> 
+			 MASTERWRITE(seqUpdate(C,blockinfo,findCh(D)),mapUpdate(I,blockinfo,True),chUpdate(D,findCh(D)))
+		 
+			 
+MASTER(C,I,D) = MASTERWRITE(C,I,D) ||| MASTERREAD(C,I)
+
+CHUNKSERVER = ChunkServer(0,emptyMap) ||| 
+				ChunkServer(1,mapFromList(<(0,1)>^<(1,2)>)) |||
+				  ChunkServer(2,mapFromList(<(2,4)>))
+
+CLIENTREAD = READER(0,1) ||| READER(1,1)
+CLIENTWRITE = WRITER(0,3,1) ||| WRITER(1,3,0)
+CLIENTSERVER = CLIENTREAD ||| CLIENTWRITE
+
+MooseFS = ((CHUNKSERVER [|{|WC,RC,writeResult|}|] CLIENTSERVER)
+	[|{|WM,RM,createResult,writeResultToMaster,getLease|}|]MASTER(<<(0,1)>,<(1,2)>,<(2,3)>>,mapFromList(<(0,False)>^<(1,False)>^<(2,False)>),<<(1,1)>,<(2,1)>,<(3,1)>>))
+    [|{|MM,WM,RM,createResult,writeResultToMaster,getLease|}|]
+	MetaLogger(<<(0,1)>,<(1,2)>,<(2,3)>>,mapFromList(<(0,False)>^<(1,False)>^<(2,False)>),<<(1,1)>,<(2,1)>,<(3,1)>>)
+assert MooseFS :[deadlock free [F]]
+assert MooseFS :[divergence free]
+System = MooseFS \{|WM,RM,createResult,WC,RC,writeResult,sync,CR,accident,MM,MM2|}
+mutalEx = getLease.1.3!False ->  End
+			[] getLease.0.3!False ->  End
+End = getLease.1.3!True -> End
+		[] getLease.0.3!True -> End
+			[] writeResultToMaster.0.3.True -> mutalEx
+				[] writeResultToMaster.1.3.True -> mutalEx
+
+assert mutalEx [T= System 
+
+
+Ma = MASTERWRITE(<<(0,1)>,<(1,2)>,<(2,3)>>,mapFromList(<(0,False)>^<(1,False)>^<(2,False)>),<<(1,1)>,<(2,1)>,<(3,1)>>)
+Me = MetaLogger(<<(0,1)>,<(1,2)>,<(2,3)>>,mapFromList(<(0,False)>^<(1,False)>^<(2,False)>),<<(1,1)>,<(2,1)>,<(3,1)>>)
+
+Mas = Ma\{|WM,RM,createResult,WC,RC,writeResult,sync,CR,accident,writeResultToMaster,getLease|}
+Met = Me\{|WM,RM,createResult,WC,RC,writeResult,sync,CR,accident,writeResultToMaster,getLease|}
+
+--assert Mas [T= Met[|{|MM,MM2|}|] Mas
+--assert Met [T= Mas[|{|MM,MM2|}|] Met
+assert Mas [T= Met
+assert Met [T= Mas
+
+findPa(<>,y) = false
+findPa(x,y) = let <(h,k)> = head(x)
+				  <(h1,k1)> = y
+				within if h == h1 and k == k1 then True else findPa(tail(x),y)
+
+check(c1,d1)(c2,d2) = let
+	match(<>,d) = True
+	match(t1,t2) = if findPa(t2,head(t1)) then match(tail(t1),t2) else False
+	within
+		match(c1,c2) and match(d1,d2)
